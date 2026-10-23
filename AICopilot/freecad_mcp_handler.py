@@ -1021,6 +1021,14 @@ class FreeCADSocketServer:
                             )
                             continue
                         result = task()
+                        # Re-stamp BEFORE publishing "done": a task longer
+                        # than stale_after (a CalculiX solve, a heavy
+                        # boolean) left the stamp stale, and the caller's
+                        # very next submission -- sent the moment poll_job
+                        # sees "done" -- was refused as "GUI thread appears
+                        # unresponsive" although the thread had just
+                        # proven itself alive by finishing this task.
+                        self._heartbeat.stamp()
                         job.update({
                             "status": "done",
                             "result": result,
@@ -1038,6 +1046,7 @@ class FreeCADSocketServer:
                             result = task()
                         finally:
                             self._gui_thread_busy = False
+                        self._heartbeat.stamp()  # same reason as the async path above
                         if req_id in self._stale_req_ids:
                             # Waiter already timed out — discard result, don't pollute the queue
                             self._stale_req_ids.discard(req_id)

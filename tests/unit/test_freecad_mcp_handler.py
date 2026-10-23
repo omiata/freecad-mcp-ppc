@@ -2924,6 +2924,36 @@ class TestGuiHeartbeatIntegration:
         finally:
             ss_mod.QtCore = None
 
+    def test_long_async_task_leaves_heartbeat_fresh_when_done(self, server):
+        """A task slower than stale_after (a CalculiX solve) must not leave
+        the stamp stale once it is published as done -- otherwise the
+        caller's next submission, sent the moment poll_job sees "done", is
+        refused as "GUI thread appears unresponsive". Reproduced live on
+        Windows / FreeCAD 1.1.4 with fem_operations run_analysis followed
+        by get_results."""
+        import freecad_mcp_handler as ss_mod
+        ss_mod.QtCore = MagicMock()
+        seen = {}
+        try:
+            def slow_task():
+                # Simulate a 10 s task: the stamp taken when it was dequeued is now old.
+                server._heartbeat._last_stamp = time.time() - 10.0
+                return {"success": True, "result": "solved"}
+
+            # job.update is the moment the result is published as done.
+            job = MagicMock()
+            job.get = MagicMock(side_effect=lambda k, d=None: {"status": "running"}.get(k, d))
+            job.__getitem__ = MagicMock(side_effect=lambda k: time.time())
+            job.update = MagicMock(side_effect=lambda *a, **k: seen.setdefault(
+                "stale_when_done", server._heartbeat.is_stale()))
+            server._async_jobs["J1"] = job
+            server._gui_task_queue.put(("async:J1", slow_task))
+            server._process_gui_tasks()
+            assert seen["stale_when_done"] is False
+        finally:
+            ss_mod.QtCore = None
+            server._async_jobs.pop("J1", None)
+
 
 class TestAsyncSubmissionVisibility:
 
