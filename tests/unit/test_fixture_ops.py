@@ -188,6 +188,25 @@ class TestSaveAndCompareRoundTrip(unittest.TestCase):
         self.assertTrue(cmp['ok'],
                         f"Round-trip compare failed: {cmp['message']}\nChecks: {cmp['details'].get('checks')}")
 
+    def test_compound_without_center_of_mass_uses_solids(self):
+        """A boolean result is a Part.Compound on FreeCAD 1.1, which has no
+        CenterOfMass; save_fixture used to raise AttributeError on it.
+        The fallback is the volume-weighted centre of the solids."""
+        obj = _make_box_obj('Cut', volume=3000.0)
+        del obj.Shape.CenterOfMass  # MagicMock: attribute access now raises AttributeError
+        s1, s2 = MagicMock(Volume=1000.0), MagicMock(Volume=2000.0)
+        s1.CenterOfMass = mock_FreeCAD.Vector(0.0, 0.0, 0.0)
+        s2.CenterOfMass = mock_FreeCAD.Vector(3.0, 6.0, 9.0)
+        obj.Shape.Solids = [s1, s2]
+        self._setup_doc(obj)
+        sv = _parse(self.h.save_fixture({'shape': 'Cut', 'fixture_name': 'compound'}))
+        self.assertTrue(sv['ok'], sv['message'])
+        with open(os.path.join(self.tmp, 'compound', 'topology.json')) as f:
+            com = json.load(f)['center_of_mass']
+        self.assertEqual(com, {'x': 2.0, 'y': 4.0, 'z': 6.0})
+        cmp = _parse(self.h.compare_to_fixture({'shape': 'Cut', 'fixture_name': 'compound'}))
+        self.assertTrue(cmp['ok'], cmp['message'])
+
     def test_round_trip_topology_json_persisted_correctly(self):
         """topology.json on disk must contain expected schema_version and counts."""
         obj = _make_box_obj('MyBox', volume=500.0, faces=10, edges=20, vertices=12)
@@ -499,6 +518,41 @@ class TestCompareToFixtureValidation(unittest.TestCase):
         self.assertFalse(cmp['ok'])
         # Message should mention what changed
         self.assertIn('face_count', cmp['message'])
+
+
+class TestFixturesRoot(unittest.TestCase):
+    """Where fixtures go: env override, repo checkout, or ~/.freecad-mcp."""
+
+    def setUp(self):
+        self._saved_env = os.environ.pop('FREECAD_MCP_FIXTURES_DIR', None)
+
+    def tearDown(self):
+        os.environ.pop('FREECAD_MCP_FIXTURES_DIR', None)
+        if self._saved_env is not None:
+            os.environ['FREECAD_MCP_FIXTURES_DIR'] = self._saved_env
+
+    def test_env_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ['FREECAD_MCP_FIXTURES_DIR'] = d
+            self.assertEqual(_fixture_ops_module._fixtures_root(), os.path.abspath(d))
+
+    def test_checkout_uses_repo_fixtures(self):
+        repo_root = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        self.assertEqual(os.path.normpath(_fixture_ops_module._fixtures_root()),
+                         os.path.join(repo_root, 'fixtures'))
+
+    def test_copied_addon_falls_back_to_user_dir(self):
+        """An addon copied into FreeCAD's Mod folder has no repo two levels
+        up; fixtures used to land in Mod/fixtures."""
+        with tempfile.TemporaryDirectory() as mod:
+            fake_file = os.path.join(mod, 'AICopilot', 'handlers', 'fixture_ops.py')
+            orig = _fixture_ops_module.__file__
+            _fixture_ops_module.__file__ = fake_file
+            try:
+                root = _fixture_ops_module._fixtures_root()
+            finally:
+                _fixture_ops_module.__file__ = orig
+            self.assertEqual(root, os.path.join(os.path.expanduser('~'), '.freecad-mcp', 'fixtures'))
 
 
 class TestFixtureNameValidation(unittest.TestCase):

@@ -27,6 +27,8 @@ import re
 import time
 from typing import Any
 
+import FreeCAD
+
 from .base import BaseHandler
 
 # ---------------------------------------------------------------------------
@@ -68,12 +70,25 @@ _COM_ABS_TOL = 0.001     # mm
 # ---------------------------------------------------------------------------
 
 def _fixtures_root() -> str:
-    """Absolute path to the fixtures/ directory (repo root / fixtures)."""
+    """Absolute path to the fixtures/ directory.
+
+    FREECAD_MCP_FIXTURES_DIR wins when set. Otherwise repo root / fixtures,
+    when this file runs from a checkout (or a symlink into one). An addon
+    COPIED into FreeCAD's Mod folder (AGENT-INSTALL.md's install steps) has
+    no repo above it: "two directories up" is then the Mod folder itself,
+    and fixtures used to land in <FreeCAD user dir>/Mod/fixtures. That case
+    falls back to ~/.freecad-mcp/fixtures.
+    """
+    override = os.environ.get('FREECAD_MCP_FIXTURES_DIR')
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     # This file lives at AICopilot/handlers/fixture_ops.py.
     # Repo root is two directories up.
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(os.path.dirname(here))
-    return os.path.join(repo_root, 'fixtures')
+    if os.path.isfile(os.path.join(repo_root, 'freecad_mcp_server.py')):
+        return os.path.join(repo_root, 'fixtures')
+    return os.path.join(os.path.expanduser('~'), '.freecad-mcp', 'fixtures')
 
 
 def _fixture_dir(fixture_name: str) -> str:
@@ -94,6 +109,30 @@ def _safe_name(name: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', name))
 
 
+def _center_of_mass(shape):
+    """shape.CenterOfMass, or the volume-weighted centre of its solids.
+
+    A boolean result (Part::Cut, Part::Fuse, ...) is a Part.Compound on
+    FreeCAD 1.1, and Part.Compound has no CenterOfMass: save_fixture raised
+    AttributeError on every boolean part (seen live on 1.1.4 / Windows).
+    A compound with no solids falls back to its bounding-box centre -- a
+    weaker chirality signal, but the same field the schema already has.
+    """
+    try:
+        return shape.CenterOfMass
+    except AttributeError:
+        pass
+    solids = list(shape.Solids)
+    total = sum(s.Volume for s in solids)
+    if not solids or total <= 0:
+        return shape.BoundBox.Center
+    return FreeCAD.Vector(
+        sum(s.CenterOfMass.x * s.Volume for s in solids) / total,
+        sum(s.CenterOfMass.y * s.Volume for s in solids) / total,
+        sum(s.CenterOfMass.z * s.Volume for s in solids) / total,
+    )
+
+
 def _extract_topology(shape) -> dict[str, Any]:
     """Pull topology summary from a FreeCAD Part.Shape object.
 
@@ -104,7 +143,7 @@ def _extract_topology(shape) -> dict[str, Any]:
     under a mirror, but CenterOfMass shifts. See _SCHEMA_VERSION's comment.
     """
     bb = shape.BoundBox
-    com = shape.CenterOfMass
+    com = _center_of_mass(shape)
     return {
         "schema_version": _SCHEMA_VERSION,
         "face_count": len(shape.Faces),
