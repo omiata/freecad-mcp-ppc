@@ -236,6 +236,49 @@ class TestReadWindowsAuthToken:
         monkeypatch.setattr(bridge, "WINDOWS_AUTH_TOKEN_PATH", str(token_path))
         assert bridge._read_windows_auth_token() is None
 
+    def test_one_token_file_per_port(self, bridge, monkeypatch, tmp_path):
+        """A spawned Windows instance on its own port writes its own token
+        file; sharing one file let it overwrite the GUI instance's token,
+        after which every GUI request was refused as Unauthorized."""
+        default = tmp_path / "windows_auth_token"
+        default.write_text("gui-token")
+        (tmp_path / "windows_auth_token_55311").write_text("worker-token")
+        monkeypatch.setattr(bridge, "WINDOWS_AUTH_TOKEN_PATH", str(default))
+        assert bridge._read_windows_auth_token("localhost:55311") == "worker-token"
+        assert bridge._read_windows_auth_token("localhost:23456") == "gui-token"
+        assert bridge._read_windows_auth_token(None) == "gui-token"
+        assert bridge._read_windows_auth_token("localhost:not-a-port") == "gui-token"
+
+    def test_per_port_name_matches_handler_side(self, bridge):
+        import freecad_mcp_handler as handler_mod
+        for port in (23456, 55311):
+            assert os.path.normpath(bridge._windows_auth_token_path(f"localhost:{port}")) == \
+                os.path.normpath(handler_mod.windows_auth_token_path(port))
+
+
+# ===========================================================================
+# _find_windows_install_binary
+# ===========================================================================
+
+class TestFindWindowsInstallBinary:
+    def test_finds_newest_program_files_install(self, bridge, monkeypatch, tmp_path):
+        """The Windows installer doesn't put FreeCAD on PATH; spawn used to
+        fail with "Cannot find FreeCADCmd binary" on a stock install."""
+        for version in ("FreeCAD 1.0", "FreeCAD 1.1"):
+            b = tmp_path / version / "bin"
+            b.mkdir(parents=True)
+            (b / "freecadcmd.exe").write_text("")
+        monkeypatch.setattr(bridge.platform, "system", lambda: "Windows")
+        monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
+        monkeypatch.delenv("PROGRAMW6432", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "nowhere"))
+        found = bridge._find_windows_install_binary("freecadcmd.exe")
+        assert found == str(tmp_path / "FreeCAD 1.1" / "bin" / "freecadcmd.exe")
+
+    def test_none_off_windows(self, bridge, monkeypatch):
+        monkeypatch.setattr(bridge.platform, "system", lambda: "Linux")
+        assert bridge._find_windows_install_binary("freecadcmd.exe") is None
+
 
 # ===========================================================================
 # _find_freecadcmd

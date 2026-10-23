@@ -301,11 +301,26 @@ WINDOWS_PORT = int(os.environ.get("FREECAD_MCP_PORT", "23456"))
 # guarantee, and it does not defend against a local administrator or
 # another process already running as the same user account.
 WINDOWS_AUTH_TOKEN_DIR = os.path.expanduser("~/.freecad-mcp")
-# Keep in sync with freecad_mcp_server.py's WINDOWS_AUTH_TOKEN_PATH (the
-# bridge side reads this same path; there's no shared-import chokepoint
-# between the two processes, matching the existing send_message/
-# receive_message duplication pattern noted above).
-WINDOWS_AUTH_TOKEN_PATH = os.path.join(WINDOWS_AUTH_TOKEN_DIR, "windows_auth_token")
+WINDOWS_DEFAULT_PORT = 23456
+
+
+def windows_auth_token_path(port: int) -> str:
+    """Token file for the instance listening on `port`.
+
+    One file per port: a second instance (spawn_freecad_instance headless
+    on Windows, FREECAD_MCP_PORT set) used to overwrite the default
+    instance's token, after which every request to the GUI instance was
+    refused as Unauthorized. The default port keeps the historical name.
+    Keep in sync with freecad_mcp_server.py's _windows_auth_token_path
+    (the bridge side reads this same path; there's no shared-import
+    chokepoint between the two processes, matching the existing
+    send_message/receive_message duplication pattern noted above).
+    """
+    name = "windows_auth_token" if port == WINDOWS_DEFAULT_PORT else f"windows_auth_token_{port}"
+    return os.path.join(WINDOWS_AUTH_TOKEN_DIR, name)
+
+
+WINDOWS_AUTH_TOKEN_PATH = windows_auth_token_path(WINDOWS_PORT)
 
 
 def _restrict_token_file_to_current_user_windows(path: str) -> bool:

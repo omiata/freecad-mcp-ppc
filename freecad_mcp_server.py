@@ -43,14 +43,28 @@ DISCOVERY_DIR = os.path.expanduser("~/.cache/freecad-mcp/instances")
 # freecad_mcp_handler.py's comment above WINDOWS_AUTH_TOKEN_PATH for what
 # confidentiality guarantee the file itself actually has on Windows.
 WINDOWS_AUTH_TOKEN_PATH = os.path.expanduser("~/.freecad-mcp/windows_auth_token")
+WINDOWS_DEFAULT_PORT = 23456
 
 
-def _read_windows_auth_token() -> str | None:
+def _windows_auth_token_path(host_port: str | None = None) -> str:
+    """Token file of the Windows instance at "host:port" -- one per port,
+    see freecad_mcp_handler.windows_auth_token_path. The default port (or
+    no endpoint) maps to WINDOWS_AUTH_TOKEN_PATH."""
+    port = WINDOWS_DEFAULT_PORT
+    if host_port and ":" in host_port:
+        with contextlib.suppress(ValueError):
+            port = int(host_port.rpartition(":")[2])
+    if port == WINDOWS_DEFAULT_PORT:
+        return WINDOWS_AUTH_TOKEN_PATH
+    return os.path.join(os.path.dirname(WINDOWS_AUTH_TOKEN_PATH), f"windows_auth_token_{port}")
+
+
+def _read_windows_auth_token(host_port: str | None = None) -> str | None:
     """Read the shared-secret token the FreeCAD-side Windows TCP listener
     wrote at startup. Re-read on every call rather than cached at import
     time, since restarting the FreeCAD instance rotates the token."""
     try:
-        with open(WINDOWS_AUTH_TOKEN_PATH, encoding="ascii") as f:
+        with open(_windows_auth_token_path(host_port), encoding="ascii") as f:
             token = f.read().strip()
             return token or None
     except OSError:
@@ -220,6 +234,13 @@ def _socket_alive(sock_path: str, timeout: float = 0.5) -> bool:
         return True
     except OSError:
         return False
+
+
+def _free_tcp_port() -> int:
+    """A localhost TCP port free right now, for a spawned Windows instance."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 def _tcp_socket_alive(host_port: str, timeout: float = 0.5) -> bool:
@@ -730,6 +751,7 @@ class _BridgeCtx:
 
         # Synthetic entry for an explicit env-var target that isn't tracked anywhere
         if self.socket_path and self.socket_path not in seen_paths:
+            seen_paths.add(self.socket_path)
             result.append({
                 "socket_path": self.socket_path,
                 "label": "default",
@@ -738,6 +760,21 @@ class _BridgeCtx:
                 "is_current": True,
                 "available": self.freecad_available,
             })
+
+        # Windows has no discovery files: keep the user's own FreeCAD (the
+        # fixed default endpoint) listed while a spawned instance is the
+        # current target, as select_freecad_instance(label="default") does.
+        if platform.system() == "Windows":
+            default_path = f"localhost:{os.environ.get('FREECAD_MCP_PORT', str(WINDOWS_DEFAULT_PORT))}"
+            if default_path not in seen_paths:
+                result.append({
+                    "socket_path": default_path,
+                    "label": "default",
+                    "headless": False,
+                    "managed": False,
+                    "is_current": False,
+                    "available": _tcp_socket_alive(default_path),
+                })
 
         return result
 
@@ -803,7 +840,27 @@ def _find_freecadcmd() -> str | None:
         if os.path.isfile(p):
             return p
 
-    return None
+    return _find_windows_install_binary("freecadcmd.exe")
+
+
+def _find_windows_install_binary(exe: str) -> str | None:
+    """bin/<exe> of the newest standard Windows FreeCAD install, or None.
+
+    The Windows installer does not put FreeCAD on PATH, so shutil.which
+    finds nothing there and spawn_freecad_instance failed with "Cannot find
+    FreeCADCmd binary" on a stock install. Installs live in
+    "<Program Files>\\FreeCAD <version>\\bin" (machine-wide) or under
+    %LOCALAPPDATA%\\Programs (per-user).
+    """
+    if platform.system() != "Windows":
+        return None
+    roots = [os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMW6432"),
+             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")]
+    found = []
+    for root in filter(None, roots):
+        found += glob.glob(os.path.join(root, "FreeCAD*", "bin", exe))
+    found = [p for p in found if os.path.isfile(p)]
+    return sorted(set(found))[-1] if found else None
 
 
 def _find_freecad_gui() -> str | None:
@@ -845,7 +902,7 @@ def _find_freecad_gui() -> str | None:
         if os.path.isfile(p):
             return p
 
-    return None
+    return _find_windows_install_binary("freecad.exe")
 
 
 def _find_headless_script() -> str | None:
@@ -2872,11 +2929,11 @@ async def main():
                 # access on (unlike the Unix-domain socket's 0600 file), so
                 # it requires this shared-secret token on every request --
                 # see WINDOWS_AUTH_TOKEN_PATH above.
-                windows_token = _read_windows_auth_token()
+                windows_token = _read_windows_auth_token(_ctx.socket_path)
                 if not windows_token:
                     return json.dumps({
                         "error": "Windows auth token not found at "
-                                 f"{WINDOWS_AUTH_TOKEN_PATH}; is the FreeCAD "
+                                 f"{_windows_auth_token_path(_ctx.socket_path)}; is the FreeCAD "
                                  "AICopilot service running?"
                     })
             else:
@@ -3425,6 +3482,16 @@ async def main():
 
             # Build a combined search space: managed + discovered.
             candidates = []
+            if platform.system() == "Windows":
+                # No discovery files on Windows: the user's own FreeCAD is
+                # the fixed default endpoint. Without this entry, switching
+                # to a spawned instance made the GUI one unreachable by
+                # label ("No instance with label 'default'").
+                candidates.append({
+                    "socket_path": f"localhost:{os.environ.get('FREECAD_MCP_PORT', str(WINDOWS_DEFAULT_PORT))}",
+                    "label": "default",
+                    "uuid": None,
+                })
             for sp, info in _ctx.instances.items():
                 candidates.append({
                     "socket_path": sp,
@@ -3478,21 +3545,32 @@ async def main():
         elif name == "spawn_freecad_instance":
             args = arguments or {}
             label = args.get("label")
-            sock_path = args.get("socket_path") or f"/tmp/freecad_mcp_{uuid.uuid4().hex[:8]}.sock"
             select_new = args.get("select", True)
             gui_mode = bool(args.get("gui", False))
             freecad_binary_override = args.get("freecad_binary")
+            is_windows = platform.system() == "Windows"
 
-            # Validate socket path: must resolve to within /tmp/ to prevent path traversal
-            # On macOS, /tmp is a symlink to /private/tmp, so accept both
-            real_sock_path = os.path.realpath(sock_path)
-            if ".." in sock_path or not (real_sock_path.startswith("/tmp/") or real_sock_path.startswith("/private/tmp/")):
-                return [types.TextContent(
-                    type="text",
-                    text=json.dumps({
-                        "error": f"Invalid socket_path: must be within /tmp/ (resolved to {real_sock_path})"
-                    })
-                )]
+            if is_windows:
+                # No AF_UNIX listener on Windows: the instance binds TCP on
+                # FREECAD_MCP_PORT, so give it a free port of its own (the
+                # default one belongs to the user's GUI FreeCAD) and address
+                # it as "localhost:<port>" like the default instance.
+                # Previously this always built a /tmp/*.sock path and the
+                # /tmp check below refused it ("resolved to C:\\tmp\\...").
+                windows_port = _free_tcp_port()
+                sock_path = f"localhost:{windows_port}"
+            else:
+                sock_path = args.get("socket_path") or f"/tmp/freecad_mcp_{uuid.uuid4().hex[:8]}.sock"
+                # Validate socket path: must resolve to within /tmp/ to prevent path traversal
+                # On macOS, /tmp is a symlink to /private/tmp, so accept both
+                real_sock_path = os.path.realpath(sock_path)
+                if ".." in sock_path or not (real_sock_path.startswith("/tmp/") or real_sock_path.startswith("/private/tmp/")):
+                    return [types.TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": f"Invalid socket_path: must be within /tmp/ (resolved to {real_sock_path})"
+                        })
+                    )]
 
             # Resolve which FreeCAD binary to launch, and which arg vector to use.
             if freecad_binary_override:
@@ -3554,13 +3632,24 @@ async def main():
                 launch_cmd = [freecad_bin, headless_script]
 
             env = os.environ.copy()
-            env["FREECAD_MCP_SOCKET"] = sock_path
+            if is_windows:
+                env["FREECAD_MCP_PORT"] = str(windows_port)
+                env.pop("FREECAD_MCP_SOCKET", None)
+            else:
+                env["FREECAD_MCP_SOCKET"] = sock_path
             if label:
                 env["FREECAD_MCP_LABEL"] = label
 
             # Captured (not DEVNULL'd) so a fast-crashing process leaves
             # actual evidence behind instead of a bare timeout message.
-            launch_log_path = f"{sock_path}.launch.log"
+            # "localhost:<port>" is not a valid Windows file name. (Aliased:
+            # handle_call_tool has a later function-local `import tempfile`,
+            # which makes the bare name local -- and unbound -- here.)
+            import tempfile as _tempfile
+            launch_log_path = (
+                os.path.join(_tempfile.gettempdir(), f"freecad_mcp_{windows_port}.launch.log")
+                if is_windows else f"{sock_path}.launch.log"
+            )
             try:
                 # Not a `with`: the fd must outlive this block (handed to
                 # Popen below) and is closed explicitly right after.
@@ -3597,7 +3686,11 @@ async def main():
                 exit_code = proc.poll()
                 if exit_code is not None:
                     break
-                if os.path.exists(sock_path):
+                if is_windows:
+                    if _tcp_socket_alive(sock_path, timeout=2.0):
+                        ready = True
+                        break
+                elif os.path.exists(sock_path):
                     try:
                         test_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                         test_sock.settimeout(2)
