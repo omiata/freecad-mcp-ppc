@@ -19,8 +19,32 @@ import uuid
 
 import pytest
 
-# Default socket for GUI-mode FreeCAD
-_DEFAULT_SOCKET = os.environ.get("FREECAD_MCP_SOCKET", "/tmp/freecad_mcp.sock")
+# Default socket for GUI-mode FreeCAD. Windows has no AF_UNIX listener: the
+# addon binds TCP on localhost:FREECAD_MCP_PORT and requires the token it
+# writes to ~/.freecad-mcp/windows_auth_token (see freecad_mcp_handler.py).
+IS_WINDOWS = os.name == "nt"
+_DEFAULT_SOCKET = os.environ.get(
+    "FREECAD_MCP_SOCKET",
+    f"localhost:{os.environ.get('FREECAD_MCP_PORT', '23456')}" if IS_WINDOWS
+    else "/tmp/freecad_mcp.sock",
+)
+WINDOWS_AUTH_TOKEN_PATH = os.path.expanduser("~/.freecad-mcp/windows_auth_token")
+
+
+def tcp_address(path: str):
+    """('localhost', 23456) for a Windows 'host:port' socket path, else None."""
+    if not IS_WINDOWS or ":" not in path:
+        return None
+    host, _, port = path.rpartition(":")
+    return (host, int(port)) if port.isdigit() else None
+
+
+def read_windows_token() -> str | None:
+    try:
+        with open(WINDOWS_AUTH_TOKEN_PATH) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
 # Will be set by the session fixture — tests import this
 _active_socket_path: str | None = None
@@ -84,6 +108,13 @@ class _PipeDrain:
 
 def _socket_responds(path: str, timeout: float = 2.0) -> bool:
     """Try connecting to a Unix socket. Returns True if it accepts."""
+    address = tcp_address(path)
+    if address is not None:
+        try:
+            with socket.create_connection(address, timeout=timeout):
+                return True
+        except OSError:
+            return False
     if not os.path.exists(path):
         return False
     try:

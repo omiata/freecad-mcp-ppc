@@ -32,14 +32,18 @@ from . import conftest
 def _socket_call(tool: str, args: dict, timeout: float = 10.0) -> dict:
     """Single socket round-trip: send a command, return the parsed response."""
     sock_path = conftest.get_socket_path()
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    address = conftest.tcp_address(sock_path)
+    s = socket.socket(socket.AF_UNIX if address is None else socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(sock_path)
+        s.connect(sock_path if address is None else address)
     except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
         raise ConnectionError(f"{e}{conftest.diagnose_dead_spawned_process()}") from e
     try:
-        msg = json.dumps({"tool": tool, "args": args}).encode("utf-8")
+        payload = {"tool": tool, "args": args}
+        if address is not None:
+            payload["token"] = conftest.read_windows_token()
+        msg = json.dumps(payload).encode("utf-8")
         s.sendall(struct.pack("!I", len(msg)) + msg)
         length_bytes = _recv_exact(s, 4)
         resp_len = struct.unpack("!I", length_bytes)[0]
