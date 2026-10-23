@@ -766,7 +766,7 @@ class _BridgeCtx:
         # current target, as select_freecad_instance(label="default") does.
         if platform.system() == "Windows":
             default_path = f"localhost:{os.environ.get('FREECAD_MCP_PORT', str(WINDOWS_DEFAULT_PORT))}"
-            if default_path not in seen_paths:
+            if default_path not in seen_paths and not any(e.get("label") == "default" for e in result):
                 result.append({
                     "socket_path": default_path,
                     "label": "default",
@@ -3863,10 +3863,20 @@ async def main():
 
             _ctx.unregister(target_path)
 
+            is_windows = platform.system() == "Windows"
+            if is_windows and _windows_auth_token_path(target_path) != WINDOWS_AUTH_TOKEN_PATH:
+                # A killed instance can't remove its own per-port token file.
+                with contextlib.suppress(OSError):
+                    os.unlink(_windows_auth_token_path(target_path))
+
             # If we just stopped the active instance, clear it so the next
-            # call re-resolves via discovery (or env var if set).
+            # call re-resolves via discovery (or env var if set). Windows has
+            # no discovery: fall back to the user's own FreeCAD.
             if _ctx.socket_path == target_path:
-                _ctx.socket_path = os.environ.get("FREECAD_MCP_SOCKET")
+                _ctx.socket_path = (
+                    f"localhost:{os.environ.get('FREECAD_MCP_PORT', str(WINDOWS_DEFAULT_PORT))}"
+                    if is_windows else os.environ.get("FREECAD_MCP_SOCKET")
+                )
 
             return [types.TextContent(
                 type="text",

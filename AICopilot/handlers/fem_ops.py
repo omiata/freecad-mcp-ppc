@@ -558,7 +558,9 @@ class FemOpsHandler(BaseHandler):
         vectors = list(getattr(result_obj, 'DisplacementVectors', None) or [])
         if vectors:
             summary["max_displacement_components_mm"] = {
-                axis: max((getattr(v, axis) for v in vectors), key=abs) for axis in ('x', 'y', 'z')
+                "x": max((v.x for v in vectors), key=abs),
+                "y": max((v.y for v in vectors), key=abs),
+                "z": max((v.z for v in vectors), key=abs),
             }
             if vm:
                 i_max = max(range(len(vm)), key=vm.__getitem__)
