@@ -1,5 +1,9 @@
 # freecad-mcp
 
+> **Fork note:** this is my fork of blwfish/freecad-mcp, with FEM added and
+> some Windows fixes. What changed is in [FORK.md](FORK.md); the rest of this
+> README is upstream's.
+
 [![Unit Tests](https://github.com/blwfish/freecad-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/blwfish/freecad-mcp/actions/workflows/tests.yml)
 [![Integration Tests](https://github.com/blwfish/freecad-mcp/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/blwfish/freecad-mcp/actions/workflows/integration-tests.yml)
 [![License: LGPL v2.1](https://img.shields.io/badge/License-LGPL_v2.1-blue.svg)](LICENSE)
