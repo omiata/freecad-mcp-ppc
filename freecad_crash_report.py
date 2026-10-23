@@ -53,12 +53,18 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from collections import deque
 from pathlib import Path
 
-OPLOG_FILE   = "/tmp/freecad_mcp_oplog.json"
+# Windows has no /tmp (it resolves to C:\tmp, usually absent) and no
+# O_NOFOLLOW: every write failed there with "module 'os' has no attribute
+# 'O_NOFOLLOW'", leaving crash reports without the operation in flight.
+OPLOG_FILE   = (os.path.join(tempfile.gettempdir(), "freecad_mcp_oplog.json")
+                if os.name == "nt" else "/tmp/freecad_mcp_oplog.json")
+_O_NOFOLLOW  = getattr(os, "O_NOFOLLOW", 0)
 MAX_OPLOG    = 10
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +111,7 @@ class OpLog:
 
     def _flush(self) -> None:
         try:
-            base_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            base_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW
             try:
                 # Try exclusive creation first so a genuinely fresh file
                 # is still created at exactly the requested mode (allowing
@@ -120,7 +126,8 @@ class OpLog:
                 # otherwise keep its old, looser permissions forever.
                 # fchmod on the already-open fd closes that gap.
                 fd = os.open(OPLOG_FILE, base_flags, 0o600)
-                os.fchmod(fd, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(list(self._ops), f, indent=2)
             self._last_write_failed = False

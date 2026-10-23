@@ -155,6 +155,17 @@ class TestOpLogFlushPermissions:
         monkeypatch.setattr(cr, "OPLOG_FILE", path)
         return path
 
+    def test_flush_writes_the_ring_buffer(self, isolated_oplog):
+        """Runs on every platform: on Windows os.O_NOFOLLOW doesn't exist
+        and every flush used to fail with AttributeError, so crash reports
+        there never knew which operation was in flight."""
+        log = cr.OpLog()
+        log.record("execute_python", {"code": "1+1"})
+        with open(isolated_oplog) as f:
+            ops = json.load(f)
+        assert ops[-1]["tool"] == "execute_python"
+        assert log._write_failures == 0
+
     def test_fresh_file_created_owner_only(self, isolated_oplog):
         log = cr.OpLog()
         log.record("execute_python", {"code": "1+1"})
