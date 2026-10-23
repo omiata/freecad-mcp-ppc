@@ -549,6 +549,17 @@ class TestCheckpointRollback:
         assert "Fillet" in result
         mock_doc.removeObject.assert_called_with("Fillet")
 
+    def test_rollback_names_objects_deleted_after_checkpoint(self, doc_handler, mock_doc):
+        """Names-only checkpoint: a deleted object can't come back, and the
+        result must say so instead of reading as a clean rollback."""
+        doc_handler.checkpoint({"name": "snap"})
+        gone = mock_doc.Objects[0].Name
+        mock_doc.Objects = mock_doc.Objects[1:]
+        result = doc_handler.rollback_to_checkpoint({"name": "snap"})
+        assert "removed 0" in result
+        assert "NOT restored" in result and gone in result
+        assert "undo" in result
+
     def test_rollback_no_checkpoint(self, doc_handler):
         result = doc_handler.rollback_to_checkpoint({"name": "nonexistent"})
         assert "No checkpoint" in result

@@ -339,6 +339,12 @@ class DocumentOpsHandler(BaseHandler):
     def rollback_to_checkpoint(self, args: dict[str, Any]) -> str:
         """Remove all objects added since the named checkpoint was taken.
 
+        A checkpoint records object NAMES only: objects deleted after it
+        cannot be brought back, and edits to surviving objects are not
+        undone. Deleted ones are named in the result, with a pointer to
+        view_control(operation='undo') -- before, "removed 0 of 0 objects"
+        read as a successful rollback while the deleted object stayed gone.
+
         Args:
             name: Checkpoint label (default 'default')
         """
@@ -370,6 +376,12 @@ class DocumentOpsHandler(BaseHandler):
             msg = f"Rollback to '{label}': removed {len(removed)} of {len(to_remove)} objects ({removed_str})"
             if failed:
                 msg += f"; FAILED to remove: {', '.join(failed)}"
+            current = {obj.Name for obj in doc.Objects}
+            missing = [n for n in checkpoint["names"] if n not in current]
+            if missing:
+                msg += (f"; NOT restored (deleted after the checkpoint -- rollback only removes "
+                        f"objects added since): {', '.join(missing)}. Try "
+                        "view_control(operation='undo') to bring them back.")
             return msg
         except Exception as e:
             return f"Error rolling back: {e}"
