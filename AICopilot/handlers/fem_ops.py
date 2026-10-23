@@ -96,13 +96,141 @@ def _positive_number(value) -> "float | None":
     return v
 
 
+# Elements wanted through the thinnest wall. Second-order tets resolve a
+# bending gradient with 2-3 across; linear ones need about twice that.
+_ELEMENTS_THROUGH_THICKNESS = {'2nd': 2.0, '1st': 4.0}
+# Shape quality q = 6*sqrt(2)*V / l_rms^3: 1 for a regular tetrahedron, 0
+# for a flat one. Below 0.1 a tet is badly shaped; below 0.01 degenerate.
+_POOR_QUALITY = 0.1
+_DEGENERATE_QUALITY = 0.01
+
+
+def _tet_quality(p0, p1, p2, p3) -> "tuple[float, float]":
+    """(q, edge_ratio) of a tetrahedron from its 4 corner points.
+
+    q is the volume-to-edge shape measure above (signed: negative means an
+    inverted element); edge_ratio is longest edge / shortest edge."""
+    pts = (p0, p1, p2, p3)
+    lengths = []
+    for i in range(4):
+        for j in range(i + 1, 4):
+            a, b = pts[i], pts[j]
+            lengths.append(math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2))
+    ax, ay, az = p1.x - p0.x, p1.y - p0.y, p1.z - p0.z
+    bx, by, bz = p2.x - p0.x, p2.y - p0.y, p2.z - p0.z
+    cx, cy, cz = p3.x - p0.x, p3.y - p0.y, p3.z - p0.z
+    volume = (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6.0
+    l_rms = math.sqrt(sum(length * length for length in lengths) / 6.0)
+    q = 6.0 * math.sqrt(2.0) * volume / l_rms ** 3 if l_rms > 0 else 0.0
+    shortest = min(lengths)
+    return q, (max(lengths) / shortest if shortest > 0 else float('inf'))
+
+
+def _mesh_quality(fem_mesh) -> dict:
+    """Shape statistics over the volume elements, from their corner nodes
+    (the first 4 of a TET4 or TET10)."""
+    nodes = fem_mesh.Nodes
+    qualities, ratios = [], []
+    for vid in fem_mesh.Volumes:
+        ids = fem_mesh.getElementNodes(vid)
+        if len(ids) < 4:
+            continue
+        q, r = _tet_quality(*(nodes[i] for i in ids[:4]))
+        qualities.append(abs(q))
+        ratios.append(r)
+    if not qualities:
+        return {"elements_checked": 0}
+    qs = sorted(qualities)
+    return {
+        "elements_checked": len(qs),
+        "min_shape_quality": round(qs[0], 4),
+        "median_shape_quality": round(qs[len(qs) // 2], 4),
+        "poor_elements": sum(1 for q in qs if q < _POOR_QUALITY),
+        "degenerate_elements": sum(1 for q in qs if q < _DEGENERATE_QUALITY),
+        "max_edge_ratio": round(max(ratios), 2),
+        "shape_quality_note": "1 = regular tetrahedron, < 0.1 poor, < 0.01 degenerate",
+    }
+
+
+def _min_wall_thickness(shape, grid: int = 3) -> "tuple[float | None, list | None]":
+    """Thinnest wall of a solid, by casting a ray inward from sample points
+    on every face and taking the nearest exit.
+
+    Returns (thickness_mm, [x, y, z] of where it was measured), or
+    (None, None) if no ray found the other side (e.g. no faces). It is an
+    estimate: a wall thinner than the sample spacing between grid points
+    can be missed, so it errs on the side of the walls it does see."""
+    import Part
+
+    length = shape.BoundBox.DiagonalLength
+    best, where = None, None
+    for face in shape.Faces:
+        try:
+            u0, u1, v0, v1 = face.ParameterRange
+        except Exception:
+            continue
+        for i in range(grid):
+            for j in range(grid):
+                u = u0 + (u1 - u0) * (i + 0.5) / grid
+                v = v0 + (v1 - v0) * (j + 0.5) / grid
+                try:
+                    pt = face.valueAt(u, v)
+                    if not face.isInside(pt, 1e-6, True):
+                        continue
+                    n = face.normalAt(u, v)
+                except Exception:
+                    continue
+                for direction in (-1.0, 1.0):  # inward first; outward if the normal is flipped
+                    start = pt + n * (direction * 1e-4)
+                    seg = Part.LineSegment(start, pt + n * (direction * length)).toShape()
+                    try:
+                        hits = [(vx.Point - pt).Length for vx in seg.section(shape).Vertexes]
+                    except Exception:
+                        hits = []
+                    hits = [h for h in hits if h > 1e-3]
+                    if hits:
+                        t = min(hits)
+                        if best is None or t < best:
+                            best, where = t, [round(pt.x, 3), round(pt.y, 3), round(pt.z, 3)]
+                        break
+    return best, where
+
+
+def _default_max_size(bbox, thickness, order: str) -> float:
+    """Element size when the caller gives none: the thinnest wall divided by
+    the elements it needs across (_ELEMENTS_THROUGH_THICKNESS), and no
+    coarser than a twentieth of the diagonal on chunky parts. Without a
+    measured wall, the smallest bounding-box side stands in for it.
+
+    It is the starting mesh, not a converged one: a convergence check
+    (re-mesh at half the size, compare) decides whether it is enough.
+    The first version took max(smallest side / 4, diagonal / 40), which
+    on a 100 mm part with 2 mm walls gave 2.5 mm elements -- less than one
+    across the wall. smallest side / 4 alone overshoots the other way on
+    plates (0.5 mm on a 2 mm plate: 770k nodes, a minute of Gmsh)."""
+    wall = thickness or min(bbox.XLength, bbox.YLength, bbox.ZLength)
+    return min(wall / _ELEMENTS_THROUGH_THICKNESS[order], bbox.DiagonalLength / 20.0)
+
+
+# Tetrahedra Gmsh produces per unit volume at size h: about 5 / h^3
+# (FreeCAD 1.1.4: 100x60x2 mm at 0.5 mm gave 479k; a 100x10x10 bar at
+# 4 mm, 1.1k). Above _MAX_ESTIMATED_ELEMENTS the mesh and the solve block
+# FreeCAD's GUI for minutes, so create_mesh asks for allow_large first.
+_TETS_PER_H3 = 5.0
+_MAX_ESTIMATED_ELEMENTS = 300_000
+
+
+def _estimated_elements(volume: float, size: float) -> int:
+    return int(volume * _TETS_PER_H3 / size ** 3) if size > 0 else 0
+
+
 class FemOpsHandler(BaseHandler):
     """Handler for FEM workbench operations (linear static, CalculiX)."""
 
     _ALLOWED_OPERATIONS = frozenset({
         "create_analysis", "set_material", "create_mesh", "add_fixed",
         "add_force", "add_pressure", "add_self_weight", "check_analysis",
-        "run_analysis", "get_results", "list_material_presets",
+        "run_analysis", "get_results", "list_material_presets", "mesh_quality",
     })
 
     # ------------------------------------------------------------------
@@ -275,12 +403,64 @@ class FemOpsHandler(BaseHandler):
         except Exception as e:
             return f"Error setting FEM material: {e}"
 
+    def _parse_refinements(self, args, shape_obj, doc):
+        """([(obj, faces, size)], error) from args['refine']: a list of
+        {"faces": [...], "size": mm, "object_name": optional}."""
+        out = []
+        for i, entry in enumerate(args.get('refine') or []):
+            if not isinstance(entry, dict):
+                return None, f"Error: refine[{i}] must be an object like {{'faces': ['Face3'], 'size': 0.5}}"
+            size = _positive_number(entry.get('size'))
+            if size is None:
+                return None, f"Error: refine[{i}].size (mm, > 0) is required"
+            sub = {'object_name': entry.get('object_name') or shape_obj.Name, 'faces': entry.get('faces')}
+            obj, faces, err = self._resolve_face_refs(sub, doc)
+            if err:
+                return None, err.replace("Error: ", f"Error: refine[{i}]: ", 1)
+            out.append((obj, faces, size))
+        return out, None
+
+    def _mesh_report(self, mesh, shape_obj, order, max_size, refinements=(), wall=None) -> dict:
+        """Thickness, elements-through-thickness and shape quality, plus
+        warnings a caller should act on before trusting a result. wall is
+        an already-measured (thickness, where) from _min_wall_thickness."""
+        thickness, where = wall if wall is not None else _min_wall_thickness(shape_obj.Shape)
+        need = _ELEMENTS_THROUGH_THICKNESS[order]
+        report = {"min_wall_thickness_mm": round(thickness, 4) if thickness else None,
+                  "min_wall_at_mm": where}
+        warnings = []
+        if thickness:
+            # Conservative: uses the global size. A refinement region on the
+            # thin wall makes the real count higher.
+            through = thickness / max_size
+            report["elements_through_thickness_est"] = round(through, 2)
+            if through < need and not refinements:
+                warnings.append(
+                    f"about {through:.1f} {order}-order elements across the thinnest wall "
+                    f"({thickness:.2f} mm at {where}); want at least {need:.0f}. Use max_size <= "
+                    f"{thickness / need:.3g} or refine those faces.")
+        quality = _mesh_quality(mesh.FemMesh)
+        report["quality"] = quality
+        if quality.get("degenerate_elements"):
+            warnings.append(f"{quality['degenerate_elements']} degenerate elements (shape quality < "
+                            f"{_DEGENERATE_QUALITY}); results near them are unreliable.")
+        if order == '1st':
+            warnings.append("1st-order tetrahedra are too stiff in bending; use '2nd' unless "
+                            "this is a quick check.")
+        report["warnings"] = warnings
+        return report
+
     def create_mesh(self, args: dict[str, Any]) -> str:
         """Mesh a solid with Gmsh and add the mesh to the analysis.
 
-        max_size (mm) is the target element size; element_order '2nd'
-        (default) avoids the shear locking of linear tetrahedra in bending.
-        Re-running with the same mesh_name re-meshes in place.
+        max_size (mm) is the global element size. When omitted it comes
+        from the part: 2 second-order (4 first-order) elements across the
+        thinnest wall, no coarser than diagonal / 20. Meshes estimated
+        above 300k elements are refused unless allow_large is true. element_order '2nd' (default) avoids the shear locking of
+        linear tetrahedra in bending. refine adds local sizes on faces
+        (Gmsh mesh regions). The result reports wall thickness, elements
+        through it and element shape quality, with warnings. Re-running
+        with the same mesh_name re-meshes in place.
         """
         try:
             doc, analysis, err = self._resolve_analysis(args)
@@ -294,13 +474,19 @@ class FemOpsHandler(BaseHandler):
                 return f"Error: {err}"
             if not shape_obj.Shape.Solids:
                 return f"Error: {object_name} has no solids to mesh"
+            order = str(args.get('element_order', '2nd'))
+            if order not in ('1st', '2nd'):
+                return f"Error: element_order must be '1st' or '2nd'; got {order!r}"
+            refinements, err = self._parse_refinements(args, shape_obj, doc)
+            if err:
+                return err
 
+            wall = _min_wall_thickness(shape_obj.Shape)
             max_size = _positive_number(args.get('max_size'))
+            size_source = "given"
             if max_size is None:
-                bb = shape_obj.Shape.BoundBox
-                # About 20 elements across the smallest dimension's scale,
-                # bounded so thin parts don't explode the node count.
-                max_size = max(min(bb.XLength, bb.YLength, bb.ZLength) / 4.0, bb.DiagonalLength / 40.0)
+                max_size = _default_max_size(shape_obj.Shape.BoundBox, wall[0], order)
+                size_source = "from part size and thinnest wall"
             min_size = args.get('min_size', 0.0) or 0.0
             try:
                 min_size = float(min_size)
@@ -308,9 +494,13 @@ class FemOpsHandler(BaseHandler):
                 return f"Error: min_size must be a number; got {args.get('min_size')!r}"
             if min_size < 0 or min_size > max_size:
                 return f"Error: min_size must be between 0 and max_size ({max_size}); got {min_size}"
-            order = str(args.get('element_order', '2nd'))
-            if order not in ('1st', '2nd'):
-                return f"Error: element_order must be '1st' or '2nd'; got {order!r}"
+            # Refinement regions add elements this estimate doesn't see; it
+            # only guards the global size.
+            estimate = _estimated_elements(shape_obj.Shape.Volume, max_size)
+            if estimate > _MAX_ESTIMATED_ELEMENTS and not args.get('allow_large'):
+                return (f"Error: about {estimate:,} elements at max_size {max_size:.3g} mm; meshing and "
+                        "solving that freezes FreeCAD for minutes. Use a coarser max_size with refine "
+                        "on the faces that need it, or pass allow_large=true.")
 
             import ObjectsFem
             from femmesh.gmshtools import GmshTools
@@ -326,6 +516,12 @@ class FemOpsHandler(BaseHandler):
             mesh.CharacteristicLengthMax = max_size
             mesh.CharacteristicLengthMin = min_size
             mesh.ElementOrder = order
+            # Re-meshing replaces the previous refinement regions.
+            for old in list(getattr(mesh, 'MeshRegionList', None) or []):
+                doc.removeObject(old.Name)
+            for i, (obj, faces, size) in enumerate(refinements):
+                region = ObjectsFem.makeMeshRegion(doc, mesh, size, f"{mesh.Name}_Refine{i + 1}")
+                region.References = [(obj, f) for f in faces]
             self.recompute(doc)
 
             t0 = time.time()
@@ -339,18 +535,48 @@ class FemOpsHandler(BaseHandler):
                         f"(nodes={fem_mesh.NodeCount}). Check the solid with "
                         "measurement_operations(operation='check_solid').")
             self.recompute(doc)
-            return json.dumps({
+            result = {
                 "mesh": mesh.Name,
                 "shape": shape_obj.Name,
                 "nodes": fem_mesh.NodeCount,
                 "volume_elements": fem_mesh.VolumeCount,
                 "element_order": order,
                 "max_size_mm": round(max_size, 4),
+                "max_size_source": size_source,
                 "min_size_mm": min_size,
+                "refinements": [{"object": o.Name, "faces": f, "size_mm": s} for o, f, s in refinements],
                 "seconds": round(elapsed, 2),
-            })
+            }
+            result.update(self._mesh_report(mesh, shape_obj, order, max_size, refinements, wall))
+            return json.dumps(result)
         except Exception as e:
             return f"Error creating FEM mesh: {e}"
+
+    def mesh_quality(self, args: dict[str, Any]) -> str:
+        """Report thickness, elements through it and shape quality of an
+        existing mesh (mesh_name, default 'Mesh') without re-meshing."""
+        try:
+            doc = self.get_document()
+            if not doc:
+                return NO_ACTIVE_DOCUMENT_ERROR
+            mesh_name = args.get('mesh_name') or 'Mesh'
+            mesh = doc.getObject(mesh_name)
+            if mesh is None or not self._is_mesh(mesh):
+                return f"Error: no Gmsh FEM mesh named {mesh_name}"
+            shape_obj = mesh.Shape
+            if shape_obj is None:
+                return f"Error: mesh {mesh_name} has no shape assigned"
+            order = mesh.ElementOrder if mesh.ElementOrder in ('1st', '2nd') else '2nd'
+            regions = list(getattr(mesh, 'MeshRegionList', None) or [])
+            report = {"mesh": mesh.Name, "nodes": mesh.FemMesh.NodeCount,
+                      "volume_elements": mesh.FemMesh.VolumeCount, "element_order": order,
+                      "max_size_mm": float(mesh.CharacteristicLengthMax),
+                      "refinements": [r.Name for r in regions]}
+            report.update(self._mesh_report(mesh, shape_obj, order,
+                                            float(mesh.CharacteristicLengthMax), regions))
+            return json.dumps(report)
+        except Exception as e:
+            return f"Error reading FEM mesh quality: {e}"
 
     def add_fixed(self, args: dict[str, Any]) -> str:
         """Fix (all translations zero) the given faces of a solid."""
@@ -579,6 +805,100 @@ class FemOpsHandler(BaseHandler):
             summary["safety_factor"] = round(sy / summary["max_von_mises_MPa"], 3)
         return summary
 
+    # ------------------------------------------------------------------
+    # Reading results somewhere other than the global maximum
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _node_table(result_obj):
+        """[(von_mises, displacement, point)] per result node."""
+        vm = list(getattr(result_obj, 'vonMises', None) or [])
+        disp = list(getattr(result_obj, 'DisplacementLengths', None) or [])
+        numbers = list(getattr(result_obj, 'NodeNumbers', None) or [])
+        mesh = getattr(result_obj, 'Mesh', None)
+        fem_mesh = getattr(mesh, 'FemMesh', None) if mesh else None
+        if fem_mesh is None or len(numbers) != len(vm):
+            return []
+        nodes = fem_mesh.Nodes
+        return [(vm[i], disp[i] if i < len(disp) else None, nodes[n]) for i, n in enumerate(numbers)]
+
+    def _support_faces(self, analysis):
+        """Shape faces referenced by fixed/displacement constraints."""
+        faces = []
+        for c in self._members(analysis, self._is_constraint):
+            if 'Fixed' not in c.TypeId and 'Displacement' not in c.TypeId:
+                continue
+            for obj, subs in c.References:
+                for sub in (subs if isinstance(subs, (list, tuple)) else (subs,)):
+                    with contextlib.suppress(Exception):
+                        faces.append(obj.Shape.getElement(sub))
+        return faces
+
+    @staticmethod
+    def _point_of(p):
+        return [round(p.x, 3), round(p.y, 3), round(p.z, 3)]
+
+    def _probe(self, analysis, result_obj, args) -> "tuple[dict, str | None]":
+        """Optional reads requested in args: point, box,
+        exclude_near_supports_mm. Returns (fields, error)."""
+        wanted = [k for k in ('point', 'box', 'exclude_near_supports_mm') if args.get(k) is not None]
+        if not wanted:
+            return {}, None
+        table = self._node_table(result_obj)
+        if not table:
+            return {}, "Error: result has no node data to probe"
+        out = {}
+        if args.get('point') is not None:
+            try:
+                px, py, pz = (float(c) for c in args['point'])
+            except (TypeError, ValueError):
+                return {}, "Error: point must be [x, y, z] in mm"
+            vm, d, p = min(table, key=lambda r: (r[2].x - px) ** 2 + (r[2].y - py) ** 2 + (r[2].z - pz) ** 2)
+            dist = math.sqrt((p.x - px) ** 2 + (p.y - py) ** 2 + (p.z - pz) ** 2)
+            out["at_point"] = {"requested_mm": [px, py, pz], "nearest_node_mm": self._point_of(p),
+                               "distance_mm": round(dist, 4), "von_mises_MPa": vm, "displacement_mm": d}
+        if args.get('box') is not None:
+            try:
+                x0, y0, z0, x1, y1, z1 = (float(c) for c in args['box'])
+            except (TypeError, ValueError):
+                return {}, "Error: box must be [xmin, ymin, zmin, xmax, ymax, zmax] in mm"
+            inside = [r for r in table if x0 <= r[2].x <= x1 and y0 <= r[2].y <= y1 and z0 <= r[2].z <= z1]
+            if not inside:
+                return {}, "Error: no result nodes inside box"
+            top = max(inside, key=lambda r: r[0])
+            out["in_box"] = {"box_mm": [x0, y0, z0, x1, y1, z1], "nodes": len(inside),
+                             "max_von_mises_MPa": top[0], "max_von_mises_location_mm": self._point_of(top[2]),
+                             "max_displacement_mm": max((r[1] for r in inside if r[1] is not None), default=None)}
+        if args.get('exclude_near_supports_mm') is not None:
+            d_ex = _positive_number(args['exclude_near_supports_mm'])
+            if d_ex is None:
+                return {}, "Error: exclude_near_supports_mm must be > 0"
+            faces = self._support_faces(analysis)
+            if not faces:
+                return {}, "Error: no fixed/displacement faces in the analysis to exclude around"
+            import Part
+
+            def near_support(p):
+                for f in faces:
+                    bb = f.BoundBox
+                    if (bb.XMin - d_ex <= p.x <= bb.XMax + d_ex and bb.YMin - d_ex <= p.y <= bb.YMax + d_ex
+                            and bb.ZMin - d_ex <= p.z <= bb.ZMax + d_ex
+                            and f.distToShape(Part.Vertex(p))[0] <= d_ex):
+                        return True
+                return False
+
+            away = [r for r in table if not near_support(r[2])]
+            if not away:
+                return {}, f"Error: every node is within {d_ex} mm of a support"
+            top = max(away, key=lambda r: r[0])
+            out["away_from_supports"] = {
+                "excluded_within_mm": d_ex, "nodes_kept": len(away), "nodes_excluded": len(table) - len(away),
+                "max_von_mises_MPa": top[0], "max_von_mises_location_mm": self._point_of(top[2])}
+            sy = self._yield_strength(analysis)
+            if sy is not None and top[0]:
+                out["away_from_supports"]["safety_factor"] = round(sy / top[0], 3)
+        return out, None
+
     def run_analysis(self, args: dict[str, Any]) -> str:
         """Write the CalculiX input, run the solver, load and summarize results.
 
@@ -639,6 +959,10 @@ class FemOpsHandler(BaseHandler):
             # load_results may add more than one result object (one per
             # output step); the last one is the final state.
             summary = self._result_summary(analysis, results[-1])
+            probe, err = self._probe(analysis, results[-1], args)
+            if err:
+                return err
+            summary.update(probe)
             self.recompute(doc)
             summary.update({
                 "success": True,
@@ -652,7 +976,12 @@ class FemOpsHandler(BaseHandler):
                     f" (working_dir: {work_dir})")
 
     def get_results(self, args: dict[str, Any]) -> str:
-        """Summarize the latest result already in the analysis (no solve)."""
+        """Summarize the latest result already in the analysis (no solve).
+
+        Optional reads: point [x, y, z] (nearest node), box [xmin, ymin,
+        zmin, xmax, ymax, zmax] (max inside), exclude_near_supports_mm
+        (max away from fixed faces, where the global peak is often a
+        singularity that grows with every refinement)."""
         try:
             _, analysis, err = self._resolve_analysis(args)
             if err:
@@ -660,6 +989,11 @@ class FemOpsHandler(BaseHandler):
             results = self._members(analysis, self._is_result)
             if not results:
                 return f"Error: {analysis.Name} has no results yet; call run_analysis first"
-            return json.dumps(self._result_summary(analysis, results[-1]))
+            summary = self._result_summary(analysis, results[-1])
+            probe, err = self._probe(analysis, results[-1], args)
+            if err:
+                return err
+            summary.update(probe)
+            return json.dumps(summary)
         except Exception as e:
             return f"Error reading FEM results: {e}"

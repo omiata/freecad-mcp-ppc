@@ -16,6 +16,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import MagicMock, patch
 
 # _freecad_mocks puts AICopilot/ on sys.path and installs the FreeCAD mocks,
 # so it must be imported before handlers.* when this file runs on its own.
@@ -30,7 +31,16 @@ from tests.unit._freecad_mocks import (  # isort: skip
     reset_mocks,
 )
 
-from handlers.fem_ops import MATERIAL_PRESETS, FemOpsHandler, _normalize_faces, _unit_vector  # isort: skip
+import handlers.fem_ops as fem_ops_module  # isort: skip
+from handlers.fem_ops import (  # isort: skip
+    MATERIAL_PRESETS,
+    FemOpsHandler,
+    _default_max_size,
+    _mesh_quality,
+    _normalize_faces,
+    _tet_quality,
+    _unit_vector,
+)
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 SERVER_PY = os.path.join(REPO_ROOT, 'freecad_mcp_server.py')
@@ -80,9 +90,31 @@ class FakeFemMesh:
         self.NodeCount = nodes
         self.VolumeCount = volumes
         self.nodes = {}
+        self.elements = {}  # volume id -> node ids
+
+    @property
+    def Nodes(self):
+        return self.nodes
+
+    @property
+    def Volumes(self):
+        return list(self.elements)
+
+    def getElementNodes(self, vid):
+        return self.elements[vid]
 
     def getNodeById(self, i):
         return self.nodes[i]
+
+
+class FakeMeshRegion(_Obj):
+    TypeId = 'Fem::MeshRegion'
+
+    def __init__(self, name, mesh, size):
+        super().__init__(name)
+        self.CharacteristicLength = size
+        self.References = []
+        mesh.MeshRegionList = list(getattr(mesh, 'MeshRegionList', [])) + [self]
 
 
 class FakeMesh(_Obj):
@@ -91,6 +123,7 @@ class FakeMesh(_Obj):
     def __init__(self, name):
         super().__init__(name)
         self.FemMesh = FakeFemMesh()
+        self.MeshRegionList = []
         self.CharacteristicLengthMax = 0.0
         self.CharacteristicLengthMin = 0.0
         self.ElementOrder = '2nd'
@@ -167,7 +200,16 @@ def _install_objectsfem(doc):
     mod.makeConstraintPressure = lambda d, name='Pressure': _append(doc, FakeConstraint(name, 'Fem::ConstraintPressure'))
     mod.makeConstraintForce = lambda d, name='Force': _append(doc, FakeForce(name))
     mod.makeConstraintSelfWeight = lambda d, name='SelfWeight': _append(doc, FakeSelfWeight(name))
+    mod.makeMeshRegion = lambda d, mesh, size, name='MeshRegion': _append(doc, FakeMeshRegion(name, mesh, size))
     sys.modules['ObjectsFem'] = mod
+
+    def remove(name):
+        obj = doc.getObject(name)
+        doc.Objects.remove(obj)
+        for o in doc.Objects:
+            if isinstance(getattr(o, 'MeshRegionList', None), list) and obj in o.MeshRegionList:
+                o.MeshRegionList.remove(obj)
+    doc.removeObject.side_effect = remove
     return mod
 
 
@@ -306,6 +348,39 @@ class TestHelpers(unittest.TestCase):
         for bad in ([0], ['Face0'], [True], ['Edge1'], ['Face'], [], None, [1.5]):
             self.assertIsNone(_normalize_faces(bad), bad)
 
+    def test_tet_quality_regular_flat_and_inverted(self):
+        s = 2 ** -0.5
+        regular = (_Vec(1, 0, -s), _Vec(-1, 0, -s), _Vec(0, 1, s), _Vec(0, -1, s))
+        q, ratio = _tet_quality(*regular)
+        self.assertAlmostEqual(abs(q), 1.0, places=6)
+        self.assertAlmostEqual(ratio, 1.0, places=6)
+        q, _ = _tet_quality(_Vec(0, 0, 0), _Vec(1, 0, 0), _Vec(0, 1, 0), _Vec(1, 1, 0))
+        self.assertAlmostEqual(q, 0.0, places=9)
+        q_pos, _ = _tet_quality(_Vec(0, 0, 0), _Vec(1, 0, 0), _Vec(0, 1, 0), _Vec(0, 0, 1))
+        q_neg, _ = _tet_quality(_Vec(0, 0, 0), _Vec(0, 1, 0), _Vec(1, 0, 0), _Vec(0, 0, 1))
+        self.assertAlmostEqual(q_pos, -q_neg)
+        _, ratio = _tet_quality(_Vec(0, 0, 0), _Vec(10, 0, 0), _Vec(0, 1, 0), _Vec(0, 0, 1))
+        self.assertAlmostEqual(ratio, 101 ** 0.5)
+
+    def test_mesh_quality_counts_poor_and_degenerate(self):
+        m = FakeFemMesh()
+        m.nodes = {1: _Vec(0, 0, 0), 2: _Vec(1, 0, 0), 3: _Vec(0, 1, 0), 4: _Vec(0, 0, 1),
+                   5: _Vec(1, 1, 0), 6: _Vec(0.5, 0.5, 0.05)}
+        m.elements = {1: [1, 2, 3, 4, 99, 99, 99, 99, 99, 99],  # TET10: corners first
+                      2: [1, 2, 3, 5], 3: [1, 2, 3, 6]}
+        report = _mesh_quality(m)
+        self.assertEqual(report['elements_checked'], 3)
+        self.assertEqual(report['degenerate_elements'], 1)  # the flat one
+        self.assertEqual(report['poor_elements'], 2)         # flat + the sliver
+        self.assertEqual(_mesh_quality(FakeFemMesh()), {'elements_checked': 0})
+
+    def test_default_max_size(self):
+        bb = MagicMock(XLength=100.0, YLength=60.0, ZLength=10.0, DiagonalLength=117.0)
+        self.assertEqual(_default_max_size(bb, None, '2nd'), 5.0)   # smallest side stands in for the wall
+        self.assertEqual(_default_max_size(bb, 2.0, '2nd'), 1.0)
+        self.assertEqual(_default_max_size(bb, 2.0, '1st'), 0.5)
+        self.assertEqual(_default_max_size(bb, 40.0, '2nd'), 5.85)  # chunky: diagonal / 20 caps it
+
     def test_unit_vector(self):
         self.assertEqual(_unit_vector([0, 0, -5]), (0.0, 0.0, -1.0))
         x, y, z = _unit_vector([1, 1, 0])
@@ -420,10 +495,79 @@ class TestCreateMesh(_FemTestBase):
         self.assertEqual(self.doc.getObject('Mesh').ElementOrder, '1st')
 
     def test_default_size_derived_from_part(self):
+        """No wall measured (the mock shape has no real faces): the smallest
+        bounding-box side stands in for it, so 10 mm / 2."""
         _install_gmsh()
         data = self.json_call('create_mesh', object_name='Beam')
-        # bbox 100x10x10: max(10/4, diag/40) = max(2.5, 100.995/40) = 2.5249
-        self.assertAlmostEqual(data['max_size_mm'], (100.0 ** 2 + 200.0) ** 0.5 / 40.0, places=3)
+        self.assertAlmostEqual(data['max_size_mm'], 5.0, places=4)
+        self.assertEqual(data['max_size_source'], 'from part size and thinnest wall')
+
+    def test_default_size_follows_thinnest_wall(self):
+        """A 2 mm wall on a 100 mm part: the old max(side/4, diagonal/40)
+        rule gave 2.5 mm elements, less than one across the wall."""
+        _install_gmsh()
+        with patch.object(fem_ops_module, '_min_wall_thickness', return_value=(2.0, [0, 0, 1])):
+            data = self.json_call('create_mesh', object_name='Beam')
+            self.assertAlmostEqual(data['max_size_mm'], 1.0)          # 2 mm / 2 second-order elements
+            self.assertEqual(data['elements_through_thickness_est'], 2.0)
+            self.assertEqual(data['warnings'], [])
+            data = self.json_call('create_mesh', object_name='Beam', element_order='1st')
+            self.assertAlmostEqual(data['max_size_mm'], 0.5)          # 1st order wants 4 across
+
+    def test_huge_mesh_needs_allow_large(self):
+        """A 1000 mm3 part at 0.05 mm is ~40M elements: refused, because
+        meshing and solving it would freeze FreeCAD's GUI for minutes."""
+        _install_gmsh()
+        assert_error_contains(self, self.call('create_mesh', object_name='Beam', max_size=0.05),
+                              'elements', 'allow_large')
+        self.json_call('create_mesh', object_name='Beam', max_size=0.05, allow_large=True)
+
+    def test_coarse_given_size_warns_about_thin_wall(self):
+        _install_gmsh()
+        with patch.object(fem_ops_module, '_min_wall_thickness', return_value=(2.0, [5, 5, 1])):
+            data = self.json_call('create_mesh', object_name='Beam', max_size=5)
+        self.assertEqual(data['elements_through_thickness_est'], 0.4)
+        self.assertEqual(len(data['warnings']), 1)
+        self.assertIn('thinnest wall', data['warnings'][0])
+        self.assertIn('max_size <= 1', data['warnings'][0])
+
+    def test_refine_creates_regions_and_remesh_replaces_them(self):
+        _install_gmsh()
+        data = self.json_call('create_mesh', object_name='Beam', max_size=4,
+                              refine=[{'faces': ['Face1'], 'size': 0.5}, {'faces': [2, 3], 'size': 1}])
+        mesh = self.doc.getObject('Mesh')
+        self.assertEqual([r.Name for r in mesh.MeshRegionList], ['Mesh_Refine1', 'Mesh_Refine2'])
+        self.assertEqual(mesh.MeshRegionList[0].CharacteristicLength, 0.5)
+        self.assertEqual(mesh.MeshRegionList[1].References, [(self.beam, 'Face2'), (self.beam, 'Face3')])
+        self.assertEqual(len(data['refinements']), 2)
+        self.json_call('create_mesh', object_name='Beam', max_size=4, refine=[{'faces': [4], 'size': 2}])
+        self.assertEqual([r.Name for r in mesh.MeshRegionList], ['Mesh_Refine1'])
+        self.assertEqual(mesh.MeshRegionList[0].References, [(self.beam, 'Face4')])
+        self.json_call('create_mesh', object_name='Beam', max_size=4)
+        self.assertEqual(mesh.MeshRegionList, [])
+
+    def test_refine_validation(self):
+        _install_gmsh()
+        assert_error_contains(self, self.call('create_mesh', object_name='Beam', refine=[{'faces': [1]}]),
+                              'refine[0].size')
+        assert_error_contains(self, self.call('create_mesh', object_name='Beam',
+                                              refine=[{'faces': ['Face9'], 'size': 1}]), 'refine[0]', 'Face9')
+        assert_error_contains(self, self.call('create_mesh', object_name='Beam', refine=['Face1']),
+                              'refine[0] must be an object')
+
+    def test_mesh_quality_operation(self):
+        _install_gmsh()
+        self.json_call('create_mesh', object_name='Beam', max_size=4)
+        mesh = self.doc.getObject('Mesh')
+        mesh.FemMesh.nodes = {1: _Vec(0, 0, 0), 2: _Vec(1, 0, 0), 3: _Vec(0, 1, 0), 4: _Vec(0, 0, 1),
+                              5: _Vec(1, 1, 0)}
+        mesh.FemMesh.elements = {10: [1, 2, 3, 4], 11: [1, 2, 3, 5]}  # second one is flat
+        with patch.object(fem_ops_module, '_min_wall_thickness', return_value=(10.0, [0, 0, 0])):
+            data = self.json_call('mesh_quality')
+        self.assertEqual(data['quality']['elements_checked'], 2)
+        self.assertEqual(data['quality']['degenerate_elements'], 1)
+        self.assertTrue(any('degenerate' in w for w in data['warnings']))
+        assert_error_contains(self, self.call('mesh_quality', mesh_name='Nope'), 'no Gmsh FEM mesh')
 
     def test_gmsh_error_reported(self):
         _install_gmsh(error='surface mesh failed')
@@ -601,6 +745,48 @@ class TestRunAnalysis(_FemTestBase):
         self.json_call('run_analysis', working_dir=self._tmp())
         data = self.json_call('get_results')
         self.assertEqual(data['max_von_mises_MPa'], 60.0)
+
+    def _solved(self):
+        self.ready_analysis()
+        _install_ccx()
+        self.json_call('run_analysis', working_dir=self._tmp())
+
+    def test_probe_point_and_box(self):
+        self._solved()
+        data = self.json_call('get_results', point=[0, 5, 9], box=[50, 0, 0, 101, 10, 10])
+        self.assertEqual(data['at_point']['nearest_node_mm'], [0.0, 5.0, 10.0])
+        self.assertAlmostEqual(data['at_point']['distance_mm'], 1.0)
+        self.assertEqual(data['at_point']['von_mises_MPa'], 60.0)
+        self.assertEqual(data['in_box']['nodes'], 1)
+        self.assertEqual(data['in_box']['max_von_mises_MPa'], 0.5)
+
+    def test_probe_away_from_supports(self):
+        """Fixed face is x = 0: nodes 1 and 2 sit on it, so the max away from
+        it is node 3's, and the safety factor follows that value."""
+        self._solved()
+
+        class Face:
+            BoundBox = MagicMock(XMin=0.0, XMax=0.0, YMin=0.0, YMax=10.0, ZMin=0.0, ZMax=10.0)
+
+            def distToShape(self, p):
+                return (abs(p.x), None, None)
+
+        self.beam.Shape.getElement = MagicMock(return_value=Face())
+        with patch.object(sys.modules['Part'], 'Vertex', side_effect=lambda p: p, create=True):
+            data = self.json_call('get_results', exclude_near_supports_mm=1)
+        away = data['away_from_supports']
+        self.assertEqual((away['nodes_kept'], away['nodes_excluded']), (1, 2))
+        self.assertEqual(away['max_von_mises_MPa'], 0.5)
+        self.assertEqual(away['max_von_mises_location_mm'], [100.0, 5.0, 5.0])
+        self.assertAlmostEqual(away['safety_factor'], 470.0)
+        self.assertEqual(data['max_von_mises_MPa'], 60.0)  # global peak still reported
+
+    def test_probe_validation(self):
+        self._solved()
+        assert_error_contains(self, self.call('get_results', point=[1, 2]), 'point must be')
+        assert_error_contains(self, self.call('get_results', box=[500, 500, 500, 600, 600, 600]),
+                              'no result nodes inside box')
+        assert_error_contains(self, self.call('get_results', exclude_near_supports_mm=0), '> 0')
 
     def _tmp(self):
         import tempfile

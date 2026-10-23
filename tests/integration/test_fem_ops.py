@@ -110,3 +110,69 @@ class TestCantilever:
         _fem_json({"operation": "create_analysis"})
         out = _fem({"operation": "run_analysis"})
         assert "not ready" in out and "no material" in out
+
+    def test_mid_span_stress_converges_while_root_peak_does_not_matter(self, cantilever_doc):
+        """Convergence check the way a caller would do it: solve at h and
+        h/2 and compare a stress read away from the clamp. At mid-span beam
+        theory gives F*(L/2)*(H/2)/I = 30 MPa on the top fibre."""
+        fixed_face, tip_face = _face_at_x(0.0), _face_at_x(L)
+        _fem_json({"operation": "create_analysis"})
+        _fem_json({"operation": "set_material", "preset": "steel_s235", "youngs_modulus": E_MPA})
+        _fem_json({"operation": "add_fixed", "object_name": "Beam", "faces": [fixed_face]})
+        _fem_json({"operation": "add_force", "object_name": "Beam", "faces": [tip_face],
+                   "force": F_N, "direction": [0, 0, -1]})
+        probe = {"point": [L / 2, B / 2, H], "exclude_near_supports_mm": 10.0}
+        runs = []
+        for size in (4.0, 2.0):
+            _fem_json({"operation": "create_mesh", "object_name": "Beam", "max_size": size})
+            runs.append(_fem_json({"operation": "run_analysis", **probe}, timeout=600.0))
+        mid = [r["at_point"]["von_mises_MPa"] for r in runs]
+        sigma_mid = F_N * (L / 2) * (H / 2) / (B * H ** 3 / 12.0)
+        assert mid[1] == pytest.approx(sigma_mid, rel=0.05)
+        assert abs(mid[1] - mid[0]) / mid[1] < 0.05          # converged at mid-span
+        away = [r["away_from_supports"]["max_von_mises_MPa"] for r in runs]
+        assert abs(away[1] - away[0]) / away[1] < 0.05
+        for r in runs:
+            assert r["away_from_supports"]["max_von_mises_location_mm"][0] >= 10.0 - 1e-6
+
+
+@pytest.fixture
+def plate_doc():
+    doc_name = f"FEMP_{int(time.time() * 1000) % 100000}"
+    send_command("view_control", {"operation": "create_document", "document_name": doc_name})
+    send_command("part_operations", {"operation": "box", "name": "Plate",
+                                     "length": 100, "width": 60, "height": 2})
+    yield doc_name
+    with contextlib.suppress(Exception):
+        _exec(f"FreeCAD.closeDocument({doc_name!r})")
+
+
+class TestMeshSizing:
+    def test_thin_plate_default_size_follows_wall(self, plate_doc):
+        """100 x 60 x 2 mm: the first default rule gave 2.5 mm elements here,
+        under one across the wall."""
+        _fem_json({"operation": "create_analysis"})
+        mesh = _fem_json({"operation": "create_mesh", "object_name": "Plate"}, timeout=300.0)
+        assert mesh["min_wall_thickness_mm"] == pytest.approx(2.0, rel=1e-3)
+        assert mesh["max_size_mm"] <= 1.0 + 1e-9
+        assert mesh["elements_through_thickness_est"] >= 2.0
+        assert mesh["warnings"] == []
+        assert mesh["quality"]["degenerate_elements"] == 0
+        assert mesh["quality"]["min_shape_quality"] > 0.0
+
+    def test_coarse_size_warns_and_refinement_adds_nodes(self, plate_doc):
+        _fem_json({"operation": "create_analysis"})
+        coarse = _fem_json({"operation": "create_mesh", "object_name": "Plate", "max_size": 5})
+        assert any("thinnest wall" in w for w in coarse["warnings"])
+        top = _exec(
+            "p = FreeCAD.ActiveDocument.getObject('Plate')\n"
+            "result = next('Face%d' % i for i, f in enumerate(p.Shape.Faces, 1) "
+            "if abs(f.CenterOfMass.z - 2) < 1e-6)")
+        top_face = next(f"Face{i}" for i in range(1, 7) if f"'Face{i}'" in json.dumps(top))
+        refined = _fem_json({"operation": "create_mesh", "object_name": "Plate", "max_size": 5,
+                             "refine": [{"faces": [top_face], "size": 1.0}]}, timeout=300.0)
+        assert refined["nodes"] > coarse["nodes"] * 2
+        assert len(refined["refinements"]) == 1
+        again = _fem_json({"operation": "mesh_quality"})
+        assert again["nodes"] == refined["nodes"]
+        assert again["refinements"] == ["Mesh_Refine1"]

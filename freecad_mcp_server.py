@@ -1952,6 +1952,11 @@ async def main():
                 "apply force/pressure/self-weight, check the setup, run the solver and read structured "
                 "results (max von Mises, max displacement, safety factor vs yield). Typical order: "
                 "create_analysis -> set_material -> create_mesh -> add_fixed -> add_force -> run_analysis. "
+                "create_mesh sizes elements from the thinnest wall unless max_size is given, can refine "
+                "faces locally, and reports wall thickness, elements through it, shape quality and "
+                "warnings (also: mesh_quality). get_results/run_analysis can read a point, a box, or the "
+                "max away from fixed faces, where the global peak is often a singularity. To check "
+                "convergence, re-mesh at half the size and compare. "
                 "Pick faces with measurement_operations(operation='list_faces'). Units: mm, N, MPa."
             ),
             inputSchema={
@@ -1963,7 +1968,7 @@ async def main():
                         "enum": [
                             "create_analysis", "set_material", "create_mesh", "add_fixed",
                             "add_force", "add_pressure", "add_self_weight", "check_analysis",
-                            "run_analysis", "get_results", "list_material_presets"
+                            "run_analysis", "get_results", "list_material_presets", "mesh_quality"
                         ]
                     },
                     "analysis_name": {"type": "string", "description": "FEM analysis object name (default 'Analysis')"},
@@ -1979,7 +1984,16 @@ async def main():
                     "density": {"type": "number", "description": "Density in kg/m^3 (set_material; needed for add_self_weight)"},
                     "yield_strength": {"type": "number", "description": "Yield strength in MPa (set_material; enables safety_factor in results)"},
                     "mesh_name": {"type": "string", "description": "Mesh object name (create_mesh, default 'Mesh'; reusing it re-meshes)"},
-                    "max_size": {"type": "number", "description": "Maximum element size in mm (create_mesh; default derived from the part size)"},
+                    "max_size": {"type": "number", "description": "Global element size in mm (create_mesh; default: 2 second-order elements across the thinnest wall, no coarser than diagonal / 20)"},
+                    "allow_large": {"type": "boolean", "description": "Mesh even if estimated above 300k elements (create_mesh; such meshes freeze FreeCAD for minutes)"},
+                    "refine": {
+                        "type": "array",
+                        "description": "Local sizes (create_mesh): [{'faces': ['Face3'], 'size': 0.5, 'object_name': optional, default the meshed solid}]",
+                        "items": {"type": "object", "properties": {
+                            "faces": {"type": "array", "items": {"type": ["string", "integer"]}},
+                            "size": {"type": "number"},
+                            "object_name": {"type": "string"}}}
+                    },
                     "min_size": {"type": "number", "description": "Minimum element size in mm (create_mesh, default 0)"},
                     "element_order": {"type": "string", "enum": ["1st", "2nd"], "description": "Element order (create_mesh, default '2nd': avoids shear locking in bending)"},
                     "force": {"type": "number", "description": "Total force in N spread over the faces (add_force)"},
@@ -1987,7 +2001,10 @@ async def main():
                     "pressure": {"type": "number", "description": "Pressure in MPa normal to the faces (add_pressure)"},
                     "reversed": {"type": "boolean", "description": "Reverse pressure so it pulls out of the material (add_pressure)"},
                     "acceleration": {"type": "number", "description": "Gravity in mm/s^2 (add_self_weight, default 9806.65)"},
-                    "working_dir": {"type": "string", "description": "Directory for CalculiX files (run_analysis; default a new temp dir)"}
+                    "working_dir": {"type": "string", "description": "Directory for CalculiX files (run_analysis; default a new temp dir)"},
+                    "point": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] mm: von Mises and displacement at the nearest node (get_results, run_analysis)"},
+                    "box": {"type": "array", "items": {"type": "number"}, "description": "[xmin, ymin, zmin, xmax, ymax, zmax] mm: max von Mises inside (get_results, run_analysis)"},
+                    "exclude_near_supports_mm": {"type": "number", "description": "Max von Mises (and safety factor) ignoring nodes within this distance of fixed faces (get_results, run_analysis)"}
                 },
                 "required": ["operation"]
             },

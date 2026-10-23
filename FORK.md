@@ -15,6 +15,14 @@ displacement and a safety factor against yield. The solver part is based on
 `LICENSES/`). The mesh is second order by default, because first-order
 tetrahedra came out about a third too stiff on a simple cantilever.
 
+Meshing tries not to be a guess. Without a size, it puts two elements
+across the thinnest wall. You can refine individual faces. Every mesh
+reports the wall thickness, how many elements fit across it, element
+shape quality and warnings. Results can be read at a point, in a box, or
+away from the fixed faces, where the peak is usually a singularity that
+keeps growing as you refine. There's no convergence button: mesh again at
+half the size and compare.
+
 **Windows fixes.**
 - Headless instances (`spawn_freecad_instance`) now start on Windows.
 - A long task (like a solve) no longer makes the next call fail with
