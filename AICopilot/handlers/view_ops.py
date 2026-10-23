@@ -420,7 +420,12 @@ class ViewOpsHandler(BaseHandler):
             return f"Error showing object: {e}"
 
     def delete_object(self, args: dict[str, Any]) -> str:
-        """Delete an object from the document."""
+        """Delete an object from the document, as one undoable transaction.
+
+        The only MCP edit that opens a FreeCAD transaction (see undo()): a
+        deletion is the hardest edit to redo by hand, and without a
+        transaction view_control(operation='undo') could not bring it back.
+        """
         try:
             object_name = args.get('object_name', '')
             if not object_name:
@@ -433,7 +438,13 @@ class ViewOpsHandler(BaseHandler):
                 return f"Error: Object '{object_name}' not found"
             # removeObject needs the internal Name; object_name may be a
             # Label that get_object resolved, so use the resolved obj.Name.
-            doc.removeObject(obj.Name)
+            doc.openTransaction(f"MCP delete {obj.Name}")
+            try:
+                doc.removeObject(obj.Name)
+            except Exception:
+                doc.abortTransaction()
+                raise
+            doc.commitTransaction()
             # Recompute so any feature that referenced the deleted object
             # (a dependent Boolean, a Sketch, a Body) doesn't sit on stale
             # computed state until the next unrelated recompute triggers it.
@@ -503,23 +514,31 @@ class ViewOpsHandler(BaseHandler):
     def undo(self, args: dict[str, Any]) -> str:
         """Undo the last operation.
 
-        KNOWN LIMITATION: this is effectively a no-op for MCP-driven changes.
-        doc.undo()/doc.redo() only replay FreeCAD *transactions*, and nothing
-        in the dispatch path (_call_on_gui_thread_async / _dispatch_to_handler
-        in freecad_mcp_handler.py) ever opens one around a handler call — that
-        only happens automatically for real GUI-driven edits. So this reports
-        "Undo completed" whether or not anything was actually undone. See
-        CLAUDE.md's Known Issues for why this isn't a small fix (transaction
-        boundaries would need to be added at the dispatch chokepoint(s), with
-        a read/write classification per operation to avoid polluting the
-        undo stack with empty transactions for read-only calls).
+        KNOWN LIMITATION: doc.undo()/doc.redo() only replay FreeCAD
+        *transactions*, and the dispatch path (_call_on_gui_thread_async /
+        _dispatch_to_handler in freecad_mcp_handler.py) never opens one
+        around a handler call -- that only happens automatically for real
+        GUI-driven edits. The one exception is delete_object, which wraps
+        its removal in a transaction. See CLAUDE.md's Known Issues for why
+        a general fix isn't small (transaction boundaries at the dispatch
+        chokepoint(s), with a read/write classification per operation to
+        avoid polluting the undo stack with empty transactions for
+        read-only calls).
+
+        Reports what it undid, or that there was nothing to undo -- it used
+        to answer "Undo completed" either way.
         """
         try:
             doc = FreeCAD.ActiveDocument
             if not doc:
                 return NO_ACTIVE_DOCUMENT_ERROR
+            names = list(getattr(doc, 'UndoNames', None) or [])
+            if getattr(doc, 'UndoCount', 1) == 0:
+                return ("Nothing to undo: MCP edits are not FreeCAD transactions, "
+                        "except view_control(operation='delete_object')")
             doc.undo()
-            return "Undo completed"
+            self.recompute(doc)
+            return f"Undo completed: {names[0]}" if names else "Undo completed"
         except Exception as e:
             return f"Error during undo: {e}"
 

@@ -121,3 +121,47 @@ class TestDeleteObject:
             fc.ActiveDocument = make_mock_doc()
             result = make_handler().delete_object({"object_name": "Ghost"})
         assert "not found" in result.lower()
+
+    def test_delete_is_one_committed_transaction(self):
+        """So view_control(operation='undo') can bring a deletion back --
+        MCP edits are otherwise not transactions and undo had nothing to
+        replay."""
+        with patch(_FREECAD_PATH) as fc:
+            doc = make_mock_doc()
+            fc.ActiveDocument = doc
+            make_handler().delete_object({"object_name": "Box"})
+        calls = [c[0] for c in doc.mock_calls if c[0] in ("openTransaction", "removeObject", "commitTransaction")]
+        assert calls == ["openTransaction", "removeObject", "commitTransaction"]
+        doc.abortTransaction.assert_not_called()
+
+    def test_failed_delete_aborts_transaction(self):
+        with patch(_FREECAD_PATH) as fc:
+            doc = make_mock_doc()
+            doc.removeObject.side_effect = RuntimeError("locked")
+            fc.ActiveDocument = doc
+            result = make_handler().delete_object({"object_name": "Box"})
+        assert result.startswith("Error")
+        doc.abortTransaction.assert_called_once()
+        doc.commitTransaction.assert_not_called()
+
+
+class TestUndo:
+    def test_reports_nothing_to_undo(self):
+        with patch(_FREECAD_PATH) as fc:
+            doc = make_mock_doc()
+            doc.UndoCount = 0
+            doc.UndoNames = []
+            fc.ActiveDocument = doc
+            result = make_handler().undo({})
+        assert "Nothing to undo" in result
+        doc.undo.assert_not_called()
+
+    def test_names_what_it_undid(self):
+        with patch(_FREECAD_PATH) as fc:
+            doc = make_mock_doc()
+            doc.UndoCount = 1
+            doc.UndoNames = ["MCP delete Box"]
+            fc.ActiveDocument = doc
+            result = make_handler().undo({})
+        doc.undo.assert_called_once()
+        assert result == "Undo completed: MCP delete Box"

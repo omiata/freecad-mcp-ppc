@@ -340,10 +340,12 @@ class DocumentOpsHandler(BaseHandler):
         """Remove all objects added since the named checkpoint was taken.
 
         A checkpoint records object NAMES only: objects deleted after it
-        cannot be brought back, and edits to surviving objects are not
-        undone. Deleted ones are named in the result, with a pointer to
-        view_control(operation='undo') -- before, "removed 0 of 0 objects"
-        read as a successful rollback while the deleted object stayed gone.
+        are not brought back, and edits to surviving objects are not
+        undone. Deleted ones are named in the result -- before, "removed 0
+        of 0 objects" read as a successful rollback while the deleted object
+        stayed gone. A deletion made with view_control(operation=
+        'delete_object') is a transaction, so view_control(operation='undo')
+        restores it.
 
         Args:
             name: Checkpoint label (default 'default')
@@ -380,8 +382,9 @@ class DocumentOpsHandler(BaseHandler):
             missing = [n for n in checkpoint["names"] if n not in current]
             if missing:
                 msg += (f"; NOT restored (deleted after the checkpoint -- rollback only removes "
-                        f"objects added since): {', '.join(missing)}. Try "
-                        "view_control(operation='undo') to bring them back.")
+                        f"objects added since): {', '.join(missing)}. If they were deleted with "
+                        "view_control(operation='delete_object'), view_control(operation='undo') "
+                        "brings the last deletion back.")
             return msg
         except Exception as e:
             return f"Error rolling back: {e}"
