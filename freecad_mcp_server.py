@@ -1888,6 +1888,58 @@ async def main():
             ),
         ),
         types.Tool(
+            name="fem_operations",
+            description=(
+                "FEM workbench, linear static with Gmsh + CalculiX: create an analysis (with solver), "
+                "set the material (preset or explicit E/nu/density/yield), mesh a solid, fix faces, "
+                "apply force/pressure/self-weight, check the setup, run the solver and read structured "
+                "results (max von Mises, max displacement, safety factor vs yield). Typical order: "
+                "create_analysis -> set_material -> create_mesh -> add_fixed -> add_force -> run_analysis. "
+                "Pick faces with measurement_operations(operation='list_faces'). Units: mm, N, MPa."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "description": "FEM operation to perform",
+                        "enum": [
+                            "create_analysis", "set_material", "create_mesh", "add_fixed",
+                            "add_force", "add_pressure", "add_self_weight", "check_analysis",
+                            "run_analysis", "get_results", "list_material_presets"
+                        ]
+                    },
+                    "analysis_name": {"type": "string", "description": "FEM analysis object name (default 'Analysis')"},
+                    "solver_name": {"type": "string", "description": "Solver object name (create_analysis, default 'CalculiX')"},
+                    "object_name": {"type": "string", "description": "Solid to mesh (create_mesh) or whose faces a constraint references"},
+                    "faces": {"type": "array", "items": {"type": ["string", "integer"]}, "description": "Faces for a constraint, e.g. ['Face1', 'Face6'] or [1, 6]"},
+                    "constraint_name": {"type": "string", "description": "Name for the new constraint object"},
+                    "preset": {"type": "string", "description": "Material preset (set_material): steel_s235, aluminium_6061_t6, pla, petg, abs. Explicit values override it."},
+                    "material_name": {"type": "string", "description": "Material object name (set_material, default 'Material'; reusing it updates the card)"},
+                    "display_name": {"type": "string", "description": "Material name written on the card"},
+                    "youngs_modulus": {"type": "number", "description": "Young's modulus in MPa (set_material)"},
+                    "poisson_ratio": {"type": "number", "description": "Poisson ratio, 0 to <0.5 (set_material)"},
+                    "density": {"type": "number", "description": "Density in kg/m^3 (set_material; needed for add_self_weight)"},
+                    "yield_strength": {"type": "number", "description": "Yield strength in MPa (set_material; enables safety_factor in results)"},
+                    "mesh_name": {"type": "string", "description": "Mesh object name (create_mesh, default 'Mesh'; reusing it re-meshes)"},
+                    "max_size": {"type": "number", "description": "Maximum element size in mm (create_mesh; default derived from the part size)"},
+                    "min_size": {"type": "number", "description": "Minimum element size in mm (create_mesh, default 0)"},
+                    "element_order": {"type": "string", "enum": ["1st", "2nd"], "description": "Element order (create_mesh, default '2nd': avoids shear locking in bending)"},
+                    "force": {"type": "number", "description": "Total force in N spread over the faces (add_force)"},
+                    "direction": {"type": "array", "items": {"type": "number"}, "description": "[x, y, z] direction of the force (add_force) or gravity (add_self_weight, default [0, 0, -1])"},
+                    "pressure": {"type": "number", "description": "Pressure in MPa normal to the faces (add_pressure)"},
+                    "reversed": {"type": "boolean", "description": "Reverse pressure so it pulls out of the material (add_pressure)"},
+                    "acceleration": {"type": "number", "description": "Gravity in mm/s^2 (add_self_weight, default 9806.65)"},
+                    "working_dir": {"type": "string", "description": "Directory for CalculiX files (run_analysis; default a new temp dir)"}
+                },
+                "required": ["operation"]
+            },
+            annotations=types.ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+            ),
+        ),
+        types.Tool(
             name="draft_operations",
             description="Draft workbench operations: arrays, clones, text annotations, and ShapeString (extrudable 3D text)",
             inputSchema={

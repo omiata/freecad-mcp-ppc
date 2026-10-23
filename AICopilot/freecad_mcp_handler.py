@@ -1739,6 +1739,7 @@ class FreeCADSocketServer:
                 "fixture_operations": self.fixture_ops,
                 "assembly_operations": self.assembly_ops,
                 "varset_operations": self.varset_ops,
+                "fem_operations": self.fem_ops,
             }
         except AttributeError as e:
             return json.dumps({

@@ -4,11 +4,11 @@ This file is for you, the AI agent. It tells you what needs to be true on this s
 
 ## What This Is
 
-freecad-mcp is a Model Context Protocol (MCP) server providing 39 tools for FreeCAD 3D CAD modeling — parametric part design, CNC toolpath generation (CAM), mesh operations, spatial analysis, screenshots, and arbitrary Python execution inside FreeCAD. Once installed and registered, these tools appear in your tool list.
+freecad-mcp is a Model Context Protocol (MCP) server providing 40 tools for FreeCAD 3D CAD modeling — parametric part design, CNC toolpath generation (CAM), mesh operations, linear-static FEM, spatial analysis, screenshots, and arbitrary Python execution inside FreeCAD. Once installed and registered, these tools appear in your tool list.
 
 **Origin:** Built by one person for personal use, on a Mac, with Claude Code. Other platforms *should* work (the code handles macOS, Windows, and Linux) but are less tested. PRs for other agents and platforms will be considered.
 
-**Client tool count limits:** MCP clients vary in how many tools they support. This server currently exposes 39 tools, which is within the limits of most clients in use today. Be aware that some clients impose hard caps — if your client silently drops tools, behavior will be unpredictable and hard to diagnose. Claude Code has no hard tool count limit.
+**Client tool count limits:** MCP clients vary in how many tools they support. This server currently exposes 40 tools, which is within the limits of most clients in use today. Be aware that some clients impose hard caps — if your client silently drops tools, behavior will be unpredictable and hard to diagnose. Claude Code has no hard tool count limit.
 
 **Non-Claude client testing:** this server has been manually smoke-tested end-to-end (real tool calls against a real running FreeCAD instance) through LM Studio's native MCP client, against `qwen/qwen2.5-coder-14b` (the primary model used for behavioral testing), `qwen/qwen3-32b`, and `google/gemma-4-e4b`. This is manual spot-checking, not a CI-gated compatibility suite — treat it as evidence the protocol round-trips cleanly through at least one non-Claude client, not as a guarantee for clients or models not listed. One confirmed client-specific gap found this way: LM Studio silently drops the MCP `initialize` handshake's `instructions` field, which is why `get_usage_guidance` exists as a second, schema-visible channel for the same guidance.
 
@@ -200,7 +200,7 @@ The file `CLAUDE.md` in the repo root is your primary reference for **using** th
 
 ### Tool Overview
 
-**16 Dispatchers** — each accepts an `operation` parameter routing to many sub-operations:
+**17 Dispatchers** — each accepts an `operation` parameter routing to many sub-operations:
 
 | Tool | What it does |
 |------|--------------|
@@ -220,6 +220,7 @@ The file `CLAUDE.md` in the repo root is your primary reference for **using** th
 | `view_control` | Screenshots, views, document management, checkpoint/rollback, clip planes |
 | `geometric_verification` | Post-operation solid/shape validity checks |
 | `fixture_operations` | Fixture/jig topology capture and comparison |
+| `fem_operations` | Linear-static FEM: analysis, material, Gmsh mesh, supports, loads, CalculiX run, structured results |
 
 **23 Single-Purpose Tools:**
 - `get_usage_guidance` — read before your first other operation in a new session: known issues to avoid, best practices, strategy/tactics overview

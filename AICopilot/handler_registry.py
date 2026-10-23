@@ -41,6 +41,7 @@ _HANDLER_CLASS_NAMES = {
     'execute_python_ops': 'ExecutePythonOpsHandler',
     'assembly_ops': 'AssemblyOpsHandler',
     'varset_ops': 'VarSetOpsHandler',
+    'fem_ops': 'FemOpsHandler',
     # GUI-sensitive handlers get the task queues for thread safety
     # (see freecad_mcp_handler.py's _instantiate_handlers) -- listed last
     # only to mirror the historical dict order; position carries no

@@ -11,6 +11,7 @@ from .diagnostics_ops import DiagnosticsOpsHandler
 from .document_ops import DocumentOpsHandler
 from .draft_ops import DraftOpsHandler
 from .execute_python_ops import ExecutePythonOpsHandler
+from .fem_ops import FemOpsHandler
 from .fixture_ops import FixtureOpsHandler
 from .inspector_ops import InspectorOpsHandler
 from .introspection_ops import IntrospectionOpsHandler
@@ -57,4 +58,5 @@ __all__ = [
     'ExecutePythonOpsHandler',
     'AssemblyOpsHandler',
     'VarSetOpsHandler',
+    'FemOpsHandler',
 ]
